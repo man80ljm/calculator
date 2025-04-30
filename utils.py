@@ -1,69 +1,53 @@
-import numpy as np
-from typing import List
+import openpyxl
+from openpyxl.utils import get_column_letter
+from openpyxl.cell import MergedCell
 
 def normalize_score(score: float) -> float:
-    """将分数规范化为整数或整数.5"""
-    return round(score * 2) / 2
+    """Normalize score to 0-100 range."""
+    return max(0, min(100, score))
 
 def get_grade_level(score: float) -> str:
-    """返回成绩等级"""
-    if score >= 90: return "优秀"
-    elif score >= 80: return "良好"
-    elif score >= 70: return "中等"
-    elif score >= 60: return "合格"
-    else: return "不达标"
+    """Determine grade level based on score."""
+    if score >= 90:
+        return "优秀"
+    elif score >= 80:
+        return "良好"
+    elif score >= 70:
+        return "中等"
+    elif score >= 60:
+        return "合格"
+    else:
+        return "不达标"
 
-def calculate_final_score(usual_score: float, midterm_score: float, final_score: float, 
-                        usual_ratio: float, midterm_ratio: float, final_ratio: float) -> float:
-    """计算最终分数，保留一位小数"""
-    return round(usual_score * usual_ratio + midterm_score * midterm_ratio + 
-                final_score * final_ratio, 1)
+def calculate_final_score(usual: float, midterm: float, final: float, 
+                         usual_ratio: float, midterm_ratio: float, final_ratio: float) -> float:
+    """Calculate final score based on ratios."""
+    return usual * usual_ratio + midterm * midterm_ratio + final * final_ratio
 
-def calculate_achievement_level(grades: List[float]) -> dict:
-    """计算达成度统计"""
-    total = len(grades)
-    if total == 0:
-        return {
-            "优秀": 0, "良好": 0, "中等": 0, "合格": 0, "不达标": 0,
-            "总人数": 0, "达成度": 0
-        }
-        
-    counts = {
-        "优秀": sum(1 for g in grades if g >= 90),
-        "良好": sum(1 for g in grades if 80 <= g < 90),
-        "中等": sum(1 for g in grades if 70 <= g < 80),
-        "合格": sum(1 for g in grades if 60 <= g < 70),
-        "不达标": sum(1 for g in grades if g < 60)
-    }
-    
-    # 计算达成度
-    achievement = (counts["优秀"]*10 + counts["良好"]*8 + 
-                  counts["中等"]*7 + counts["合格"]*6 + 
-                  counts["不达标"]*5) / (total * 10)
-    
-    counts["总人数"] = total
-    counts["达成度"] = achievement
-    
-    return counts
+def calculate_achievement_level(score: float) -> float:
+    """Calculate achievement level as a percentage."""
+    return score / 100
 
-def adjust_column_widths(worksheet) -> None:
-    """调整Excel列宽以适应内容"""
-    for column in worksheet.columns:
-        max_length = 0
-        column_letter = column[0].column_letter  # 获取列字母
-        for cell in column:
+def adjust_column_widths(worksheet):
+    """Adjust column widths based on content, handling MergedCell correctly."""
+    column_widths = {}
+    
+    # 遍历工作表中的所有单元格
+    for row in worksheet.rows:
+        for cell in row:
             try:
-                # 计算单元格内容的长度（中文字符按2个字符宽度计算）
-                cell_value = str(cell.value)
-                length = 0
-                for char in cell_value:
-                    if ord(char) > 127:  # 假设ASCII大于127的为中文
-                        length += 2
-                    else:
-                        length += 1
-                if length > max_length:
-                    max_length = length
-            except:
-                pass
-        adjusted_width = max_length + 2  # 额外增加2个单位宽度
-        worksheet.column_dimensions[column_letter].width = adjusted_width
+                # 跳过 MergedCell 类型的单元格
+                if cell.value and not isinstance(cell, MergedCell):
+                    # 使用 cell.column 获取列号（整数），转换为列字母
+                    col_letter = get_column_letter(cell.column)
+                    # 计算单元格内容的字符长度（考虑中文字符）
+                    cell_len = sum(2 if ord(char) > 127 else 1 for char in str(cell.value))
+                    # 更新该列的最大宽度
+                    column_widths[col_letter] = max(column_widths.get(col_letter, 8), cell_len + 2)
+            except Exception as e:
+                print(f"Error adjusting column width for cell {cell.coordinate}: {str(e)}")
+                continue
+    
+    # 设置列宽
+    for col_letter, width in column_widths.items():
+        worksheet.column_dimensions[col_letter].width = min(width, 50)  # 限制最大宽度为 50

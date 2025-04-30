@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import pandas as pd
+from PyQt6.QtGui import QIcon  # 导入 QIcon 类
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QFileDialog, QMessageBox, QGridLayout, QDialog, 
@@ -231,9 +232,11 @@ class GradeAnalysisApp(QMainWindow):
             print(f"保存配置文件失败: {str(e)}")
     
     def initUI(self):
+        # 设置窗口图标
+        self.setWindowIcon(QIcon(r'D:\calculator\calculator.ico'))
         # 设置窗口基本属性
         self.setWindowTitle('Scores Calculator')
-        self.setMinimumSize(800, 600)  # 设置最小尺寸，允许动态扩展
+        self.setMinimumSize(800, 600)
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #E6E6E6;
@@ -330,7 +333,7 @@ class GradeAnalysisApp(QMainWindow):
         # 权重输入框容器（使用QGridLayout支持换行）
         self.weights_container = QGridLayout()
         self.weights_container.setSpacing(10)
-        self.weights_container.setVerticalSpacing(15)  # 增加行间距，美观
+        self.weights_container.setVerticalSpacing(15)
         self.weight_inputs = []
         objectives_layout.addLayout(self.weights_container)
         
@@ -338,7 +341,7 @@ class GradeAnalysisApp(QMainWindow):
         
         # 第二行：成绩占比
         ratios_layout = QHBoxLayout()
-        ratios_layout.setSpacing(30)  # 输入框之间的间距
+        ratios_layout.setSpacing(30)
         
         # 平时成绩占比
         usual_layout = QVBoxLayout()
@@ -389,7 +392,7 @@ class GradeAnalysisApp(QMainWindow):
         
         # 按钮布局：四个按钮平均分布
         self.buttons_layout = QHBoxLayout()
-        self.buttons_layout.setSpacing(10)  # 设置按钮间距
+        self.buttons_layout.setSpacing(10)
         
         self.import_btn = QPushButton('导入文件')
         self.settings_btn = QPushButton('设置')
@@ -424,6 +427,11 @@ class GradeAnalysisApp(QMainWindow):
         self.midterm_ratio_input.setText('0.3')
         self.final_ratio_input.setText('0.5')
         
+        # 设置 Tab 顺序（初始设置，确保从 num_objectives_input 到 usual_ratio_input）
+        self.setTabOrder(self.num_objectives_input, self.usual_ratio_input)
+        self.setTabOrder(self.usual_ratio_input, self.midterm_ratio_input)
+        self.setTabOrder(self.midterm_ratio_input, self.final_ratio_input)
+        
         self.adjust_button_widths()
 
     def resizeEvent(self, event):
@@ -433,14 +441,12 @@ class GradeAnalysisApp(QMainWindow):
 
     def adjust_button_widths(self):
         """调整按钮宽度以实现平均分布"""
-        # 获取主窗口的可用宽度（减去边距）
-        window_width = self.width() - 60  # 左右边距共60（30+30）
-        button_count = 4  # 四个按钮
-        spacing = 10  # 按钮间距
+        window_width = self.width() - 60
+        button_count = 4
+        spacing = 10
         total_spacing = spacing * (button_count - 1)
         button_width = (window_width - total_spacing) // button_count
         
-        # 设置每个按钮的宽度
         self.import_btn.setMinimumWidth(button_width)
         self.settings_btn.setMinimumWidth(button_width)
         self.export_btn.setMinimumWidth(button_width)
@@ -461,23 +467,32 @@ class GradeAnalysisApp(QMainWindow):
         
         try:
             num_objectives = int(self.num_objectives_input.text())
-            if num_objectives <= 0 or num_objectives > 15:  # 限制最大数量
+            if num_objectives <= 0 or num_objectives > 15:
                 return
                 
             # 使用QGridLayout支持换行，每行最多5个输入框
             columns_per_row = 5
-            validator = QDoubleValidator(0.0, 1.0, 2)  # 限制输入0-1的小数
+            validator = QDoubleValidator(0.0, 1.0, 2)
             for i in range(num_objectives):
                 weight_input = QLineEdit()
                 weight_input.setFixedWidth(80)
                 weight_input.setPlaceholderText(f'权重{i+1}')
-                weight_input.setValidator(validator)  # 限制输入
-                weight_input.textEdited.connect(self.validate_weights_sum)  # 实时校验
+                weight_input.setValidator(validator)
+                weight_input.textEdited.connect(self.validate_weights_sum)
                 self.weight_inputs.append(weight_input)
                 row = i // columns_per_row
                 col = i % columns_per_row
                 self.weights_container.addWidget(weight_input, row, col)
-                
+            
+            # 动态设置 Tab 顺序，从 num_objectives_input 到第一个 weight_input
+            if self.weight_inputs:
+                # 确保从 num_objectives_input 切换到第一个 weight_input
+                self.setTabOrder(self.num_objectives_input, self.weight_inputs[0])
+                # 设置 weight_inputs 之间的 Tab 顺序
+                for i in range(len(self.weight_inputs) - 1):
+                    self.setTabOrder(self.weight_inputs[i], self.weight_inputs[i + 1])
+                # 从最后一个 weight_input 切换到 usual_ratio_input
+                self.setTabOrder(self.weight_inputs[-1], self.usual_ratio_input)
         except ValueError:
             pass
 
@@ -556,7 +571,6 @@ class GradeAnalysisApp(QMainWindow):
                 weight = float(text)
                 weights.append(weight)
             
-            # 仅校验总和是否为1，移除 low <= high 校验
             if abs(sum(weights) - 1) > 0.0001:
                 raise ValueError("总权重系数为1")
             
@@ -610,7 +624,13 @@ class GradeAnalysisApp(QMainWindow):
             objective_requirements=self.objective_requirements
         )
         
-        self.processor.load_previous_achievement(self.previous_achievement_file)
+        # 检查 previous_achievement_file 是否存在，如果不存在则跳过加载
+        if self.previous_achievement_file and os.path.exists(self.previous_achievement_file):
+            self.processor.load_previous_achievement(self.previous_achievement_file)
+        else:
+            # 如果文件不存在，设置默认值（所有达成度为 0），避免报错
+            self.processor.load_previous_achievement(None)
+        
         self.processor.store_api_key(self.api_key)
         
         try:
@@ -620,7 +640,6 @@ class GradeAnalysisApp(QMainWindow):
             # 构造当前达成度数据
             self.current_achievement = {}
             for i in range(1, num_objectives + 1):
-                # 从分析报告中提取达成度
                 df = pd.read_excel(f"{os.path.dirname(self.input_file)}/{self.course_name_input.text()}课程目标达成度分析表.xlsx")
                 m_row = df[df['考核环节'] == '课程分目标达成度\n(M)']
                 if not m_row.empty:
@@ -638,12 +657,17 @@ class GradeAnalysisApp(QMainWindow):
             QMessageBox.warning(self, '错误', '请先进行成绩分析')
             return
         
-        # 创建线程
+        # 检查设置中的内容是否完善
+        if not self.course_description or not self.objective_requirements or not self.previous_achievement_file:
+            QMessageBox.warning(self, '提示', '请完善设置中的内容')
+            return
+        
+        # 启动线程
         self.report_thread = GenerateReportThread(self.processor, self.num_objectives, self.current_achievement)
         self.report_thread.finished.connect(self.on_generate_ai_report_finished)
         self.report_thread.error.connect(self.on_generate_ai_report_error)
         self.report_thread.progress.connect(self.update_status_label)
-        self.ai_report_btn.setEnabled(False)  # 禁用按钮，防止重复点击
+        self.ai_report_btn.setEnabled(False)
         self.report_thread.start()
 
     def on_generate_ai_report_finished(self):
@@ -656,7 +680,13 @@ class GradeAnalysisApp(QMainWindow):
         """生成报告失败时的回调"""
         self.ai_report_btn.setEnabled(True)
         self.status_label.setText("生成AI分析报告失败！")
-        QMessageBox.critical(self, '错误', error_message)
+        # 区分错误类型，显示不同的提示
+        if "请先设置API Key" in error_message:
+            QMessageBox.critical(self, '错误', '请填写API KEY')
+        elif "API 调用失败" in error_message or "API 返回格式错误" in error_message:
+            QMessageBox.critical(self, '错误', 'API KEY无效！')
+        else:
+            QMessageBox.critical(self, '错误', error_message)
 
     def update_status_label(self, message):
         """更新状态标签"""

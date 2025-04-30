@@ -3,8 +3,9 @@ import numpy as np
 import pandas as pd
 import requests
 from typing import List, Dict
-from openpyxl.styles import Alignment
-from utils import normalize_score, get_grade_level, calculate_final_score, calculate_achievement_level
+from openpyxl.styles import Alignment, PatternFill, Font
+import openpyxl
+from utils import normalize_score, get_grade_level, calculate_final_score, calculate_achievement_level, adjust_column_widths
 import time
 
 class GradeProcessor:
@@ -57,7 +58,7 @@ class GradeProcessor:
     def call_deepseek_api(self, prompt: str) -> str:
         """调用 DeepSeek API 获取答案，增加重试机制"""
         if not self.api_key:
-            return "请先设置 API Key"
+            return "请先设置API Key"
         
         url = "https://api.deepseek.com/v1/chat/completions"
         api_key = self.api_key.strip().strip('<').strip('>')
@@ -65,8 +66,14 @@ class GradeProcessor:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        # 修改 prompt，添加回答要求
-        prompt = f"{prompt}\n用一段话回答，不要分点阐述，同时控制字数在150字以内。"
+        # 根据问题类型设置不同的字数限制
+        if "针对上一年度存在问题的改进情况" in prompt:
+            max_tokens = 200  # 200 字以内
+            prompt = f"{prompt}\n用一段话回答，不要分点阐述，同时控制字数在200字以内。"
+        else:
+            max_tokens = 100  # 100 字以内
+            prompt = f"{prompt}\n用一段话回答，不要分点阐述，同时控制字数在100字以内。"
+        
         payload = {
             "model": "deepseek-chat",
             "messages": [
@@ -75,7 +82,7 @@ class GradeProcessor:
             ],
             "temperature": 0.7,
             "top_p": 1,
-            "max_tokens": 150,
+            "max_tokens": max_tokens,
             "stream": False
         }
         
@@ -333,24 +340,48 @@ class GradeProcessor:
         
         try:
             with pd.ExcelWriter(detail_output, engine='openpyxl') as writer:
-                result_df.to_excel(writer, index=False, sheet_name='Sheet1')
+                # 表格从第 1 行开始写入（startrow=0），移除课程简介
+                start_row = 0
+                result_df.to_excel(writer, index=False, sheet_name='Sheet1', startrow=start_row)
                 
                 worksheet = writer.sheets['Sheet1']
-                if self.course_description:
-                    worksheet.cell(row=1, column=1).value = f"课程简介: {self.course_description}"
                 
+                # 设置表格内容居中（包括表头）
+                table_start_row = start_row + 1
+                table_end_row = table_start_row + len(result_df)
+                num_columns = len(result_df.columns)
+                for row in range(table_start_row, table_end_row + 1):
+                    for col in range(1, num_columns + 1):
+                        cell = worksheet.cell(row=row, column=col)
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                
+                # 标记“总和”行为黄色
+                yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                for row_idx, row_data in result_df.iterrows():
+                    if row_data['课程目标'] == '总和':
+                        excel_row = table_start_row + row_idx + 1  # 转换为 Excel 行号
+                        for col in range(1, num_columns + 1):
+                            cell = worksheet.cell(row=excel_row, column=col)
+                            cell.fill = yellow_fill
+                
+                # 先调整列宽，再进行合并操作
+                adjust_column_widths(worksheet)
+                
+                # 强制设置姓名列（A 列）宽度为 8 个字符
+                worksheet.column_dimensions['A'].width = 8
+                
+                # 合并姓名列相同的单元格
                 current_name = None
-                start_row = 2 if not self.course_description else 3
-                
-                for i, name in enumerate(result_df['学生姓名'], start=start_row):
+                merge_start_row = table_start_row + 1  # 跳过表头行
+                for i, name in enumerate(result_df['学生姓名'], start=merge_start_row):
                     if name != current_name:
-                        if current_name is not None and start_row != i-1:
-                            worksheet.merge_cells(f'A{start_row}:A{i-1}')
+                        if current_name is not None and merge_start_row != i:
+                            worksheet.merge_cells(f'A{merge_start_row}:A{i-1}')
                         current_name = name
-                        start_row = i
+                        merge_start_row = i
                 
-                if start_row != i:
-                    worksheet.merge_cells(f'A{start_row}:A{i}')
+                if merge_start_row != i:
+                    worksheet.merge_cells(f'A{merge_start_row}:A{i}')
         except Exception as e:
             print(f"Error writing to Excel: {str(e)}")
             raise
@@ -440,6 +471,13 @@ class GradeProcessor:
                 
                 worksheet = writer.sheets['Sheet1']
                 
+                # 设置“课程目标”列（从 C 列开始）内容居中
+                num_rows = len(analysis_df) + 1  # 包括表头
+                for col in range(3, 3 + len(objectives)):  # C 列到 C+len(objectives)-1 列
+                    for row in range(1, num_rows + 1):
+                        cell = worksheet.cell(row=row, column=col)
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                
                 current_exam = None
                 start_row = 2
                 for i, exam in enumerate(analysis_df['考核环节'], start=2):
@@ -462,6 +500,8 @@ class GradeProcessor:
                 worksheet.merge_cells(f'A{total_row_idx}:B{total_row_idx}')
                 worksheet.merge_cells(f'C{total_row_idx}:{chr(ord("C") + len(objectives) - 1)}{total_row_idx}')
                 worksheet[f'C{total_row_idx}'].alignment = Alignment(horizontal='center', vertical='center')
+                
+                adjust_column_widths(worksheet)
         except Exception as e:
             print(f"Error writing to Excel: {str(e)}")
             raise
@@ -471,11 +511,21 @@ class GradeProcessor:
     def load_previous_achievement(self, file_path: str) -> None:
         """加载上一学年达成度表，处理目标数量不一致的情况"""
         if not file_path:
+            # 如果没有文件，初始化默认值（全部为 0）
             self.previous_achievement_data = {f'课程目标{i}': 0 for i in range(1, 6)}
             self.previous_achievement_data['课程总目标'] = 0
             return
         
         try:
+            # 检查文件是否存在
+            if not os.path.exists(file_path):
+                # 如果文件不存在，初始化默认值，而不是抛出异常
+                self.previous_achievement_data = {f'课程目标{i}': 0 for i in range(1, 6)}
+                self.previous_achievement_data['课程总目标'] = 0
+                if self.status_label:
+                    self.status_label.setText("未找到上一学年达成度表，已使用默认值")
+                return
+            
             df = pd.read_excel(file_path)
             print(f"加载文件: {file_path}")
             print(f"表格列名: {df.columns.tolist()}")
@@ -558,11 +608,11 @@ class GradeProcessor:
             '下一年度目标达程度': next_total
         })
         
-        questions = [
-            "针对上一年度存在问题的改进情况",
-            *[f"课程目标{i}达成情况分析" for i in range(1, 6)],
-            *[f"该课程目标{i}达成情况存在问题分析及改进措施" for i in range(1, 6)]
-        ]
+        # 调整问题排列顺序，按目标顺序排列
+        questions = ["针对上一年度存在问题的改进情况"]
+        for i in range(1, 6):
+            questions.append(f"课程目标{i}达成情况分析")
+            questions.append(f"该课程目标{i}达成情况存在问题分析及改进措施")
         
         context = f"课程简介: {self.course_description}\n"
         for i, req in enumerate(self.objective_requirements, 1):
@@ -595,26 +645,40 @@ class GradeProcessor:
                 worksheet = writer.sheets['Sheet1']
                 
                 # 设置“课程目标1”到“课程总目标”行的内容居中（前 6 行）
-                for row in range(2, 8):  # Excel 行号从 1 开始，第 2 行到第 7 行
-                    for col in range(1, 6):  # 列 A 到 E（第 1 列到第 5 列）
+                for row in range(2, 8):
+                    for col in range(1, 6):
                         cell = worksheet.cell(row=row, column=col)
                         cell.alignment = Alignment(horizontal='center', vertical='center')
 
                 # 写入 DeepSeek API 的问题和回答
-                start_row = len(df) + 2  # 在表格下方空一行后开始写入
+                start_row = len(df) + 2  # 第 8 行开始
+                # 添加分类标题“课程目标达成情况、存在问题分析及改进措施”
+                worksheet[f'A{start_row}'].value = "课程目标达成情况、存在问题分析及改进措施"
+                worksheet[f'A{start_row}'].alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                end_row = start_row + len(questions) - 1  # 第 18 行结束
+                worksheet.merge_cells(f'A{start_row}:A{end_row}')
+
+                # 写入问题和回答，并设置格式
                 for i, (question, answer) in enumerate(zip(questions, answers)):
                     row = start_row + i
-                    worksheet[f'A{row}'].value = question
-                    worksheet[f'B{row}'].value = answer
-                    # 合并 B 列到 E 列为一个单元格
-                    worksheet.merge_cells(f'B{row}:E{row}')
-                    worksheet[f'B{row}'].alignment = Alignment(wrap_text=True, vertical='top')
-                    # 设置行高为 80 磅
+                    worksheet[f'B{row}'].value = question
+                    worksheet[f'C{row}'].value = answer
+                    worksheet.merge_cells(f'C{row}:E{row}')
+                    # 设置字体大小为 10 号，垂直居中
+                    cell_b = worksheet[f'B{row}']
+                    cell_c = worksheet[f'C{row}']
+                    cell_b.font = Font(size=10)
+                    cell_c.font = Font(size=10)
+                    cell_b.alignment = Alignment(wrap_text=True, vertical='center')
+                    cell_c.alignment = Alignment(wrap_text=True, vertical='center')
                     worksheet.row_dimensions[row].height = 80
 
                 # 设置列宽（单位为字符宽度）
-                worksheet.column_dimensions['A'].width = 20  # A 列宽 20 字符
-                worksheet.column_dimensions['B'].width = 20  # B 列宽 20 字符（B 到 E 已合并）
+                worksheet.column_dimensions['A'].width = 22
+                worksheet.column_dimensions['B'].width = 22
+                worksheet.column_dimensions['C'].width = 22
+                worksheet.column_dimensions['D'].width = 22
+                worksheet.column_dimensions['E'].width = 22
         except Exception as e:
             print(f"Error writing to Excel: {str(e)}")
             raise
@@ -628,9 +692,7 @@ class GradeProcessor:
     def generate_ai_report(self, num_objectives: int, current_achievement: Dict[str, float]) -> None:
         """生成AI分析报告"""
         if not self.api_key:
-            if self.status_label:
-                self.status_label.setText("请先设置API Key")
-            return
+            raise ValueError("请先设置API Key")
         
         course_name = self.course_name_input.text()
         if not course_name:

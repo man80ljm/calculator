@@ -10,7 +10,7 @@ openpyxl: 作为 pandas 的 Excel 写入引擎。
 
 安装依赖
 为加速下载，推荐使用清华大学的 PyPI 镜像源。执行以下命令安装所有依赖：
-pip install PyQt6 pandas numpy openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install PyQt6 pandas numpy requests openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 其他国内镜像源（可选）
 如果清华镜像源不可用，可尝试以下镜像源：
