@@ -1,11 +1,9 @@
 import os
 import numpy as np
 import pandas as pd
-import requests
-from typing import List, Dict
+from typing import List
 from openpyxl.styles import Alignment
-from utils import normalize_score, get_grade_level, calculate_final_score, calculate_achievement_level
-import time
+from utils import normalize_score, get_grade_level, calculate_final_score, calculate_achievement_level, adjust_column_widths
 
 class GradeProcessor:
     def __init__(self, course_name_input, num_objectives_input, weight_inputs, usual_ratio_input, 
@@ -23,85 +21,6 @@ class GradeProcessor:
         self.objective_requirements = objective_requirements or []
         self.previous_achievement_data = None
         self.api_key = None
-
-    def test_deepseek_api(self, api_key: str) -> str:
-        """测试 DeepSeek API 连接"""
-        url = "https://api.deepseek.com/v1/chat/completions"
-        api_key = api_key.strip().strip('<').strip('>')
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "测试连接"}
-            ],
-            "temperature": 0.7,
-            "top_p": 1,
-            "max_tokens": 10,
-            "stream": False
-        }
-        
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=10)
-            response.raise_for_status()
-            return "连接成功"
-        except requests.RequestException as e:
-            error_message = f"连接失败: {str(e)}"
-            if hasattr(e, 'response') and e.response is not None:
-                error_message += f"\n服务器返回: {e.response.text}"
-            return error_message
-
-    def call_deepseek_api(self, prompt: str) -> str:
-        """调用 DeepSeek API 获取答案，增加重试机制"""
-        if not self.api_key:
-            return "请先设置 API Key"
-        
-        url = "https://api.deepseek.com/v1/chat/completions"
-        api_key = self.api_key.strip().strip('<').strip('>')
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        # 修改 prompt，添加回答要求
-        prompt = f"{prompt}\n用一段话回答，不要分点阐述，同时控制字数在150字以内。"
-        payload = {
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant specializing in course analysis and improvement."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.7,
-            "top_p": 1,
-            "max_tokens": 150,
-            "stream": False
-        }
-        
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
-                response.raise_for_status()
-                return response.json()['choices'][0]['message']['content'].strip()
-            except requests.Timeout:
-                if attempt < max_retries - 1:
-                    print(f"API 调用超时，正在重试（第 {attempt + 1}/{max_retries} 次）...")
-                    time.sleep(2)
-                    continue
-                return "API 调用超时，请检查网络连接或稍后重试（可能需要使用 VPN 或代理访问 api.deepseek.com）"
-            except requests.RequestException as e:
-                error_message = f"API 调用失败: {str(e)}"
-                if hasattr(e, 'response') and e.response is not None:
-                    error_message += f"\n服务器返回: {e.response.text}"
-                if attempt < max_retries - 1:
-                    print(f"API 调用失败，正在重试（第 {attempt + 1}/{max_retries} 次）...")
-                    time.sleep(2)
-                    continue
-                return error_message
-            except (KeyError, IndexError):
-                return "API 返回格式错误，无法解析结果"
 
     def calculate_score_bounds(self, target_score: float, spread_mode: str) -> tuple:
         spread_ranges = {'large': 23, 'medium': 13, 'small': 8}
@@ -121,15 +40,16 @@ class GradeProcessor:
         """生成初始整数分数，分段体现正态分布或偏态分布"""
         scores = np.zeros(n, dtype=int)
         mean = target
-        std = (max_bound - min_bound) / 2
+        std = (max_bound - min_bound) / 2  # 增大标准差，确保波动范围
 
+        # 分段生成正态分布，增加极端值比例
         if dist_type == 'normal':
             segments = [
-                (mean - 3*std, mean - 2*std, 0.10),
-                (mean - 2*std, mean - std, 0.20),
-                (mean - std, mean + std, 0.40),
-                (mean + std, mean + 2*std, 0.20),
-                (mean + 2*std, mean + 3*std, 0.10)
+                (mean - 3*std, mean - 2*std, 0.10),  # 10% 低于 -2σ
+                (mean - 2*std, mean - std, 0.20),    # 20% 在 -2σ 到 -1σ
+                (mean - std, mean + std, 0.40),      # 40% 在 -1σ 到 +1σ
+                (mean + std, mean + 2*std, 0.20),   # 20% 在 +1σ 到 +2σ
+                (mean + 2*std, mean + 3*std, 0.10)  # 10% 高于 +2σ
             ]
         elif dist_type == 'left_skewed':
             segments = [
@@ -145,14 +65,16 @@ class GradeProcessor:
                 (mean, mean + std, 0.2),
                 (mean + std, max_bound, 0.1)
             ]
-        else:
+        else:  # uniform
             segments = [(min_bound, max_bound, 1.0)]
 
+        # 根据权重分配分数
         remaining_indices = list(range(n))
         for segment_min, segment_max, proportion in segments:
-            num_scores = max(1, int(round(proportion * n)))
+            num_scores = max(1, int(round(proportion * n)))  # 至少分配 1 个分数
             if num_scores == 0:
                 continue
+            # 确保 low < high
             low = max(int(segment_min), int(min_bound))
             high = min(int(segment_max), int(max_bound)) + 1
             if low >= high:
@@ -161,15 +83,17 @@ class GradeProcessor:
                 if low >= high:
                     low = int(min_bound)
                     high = int(max_bound) + 1
+            # 随机选择 num_scores 个索引
             chosen_indices = np.random.choice(remaining_indices, min(num_scores, len(remaining_indices)), replace=False)
             for idx in chosen_indices:
                 try:
                     scores[idx] = np.random.randint(low, high)
                 except ValueError as e:
                     print(f"Error in np.random.randint: low={low}, high={high}, error={str(e)}")
-                    scores[idx] = np.random.randint(int(min_bound), int(max_bound) + 1)
+                    scores[idx] = np.random.randint(int(min_bound), int(max_bound) + 1)  # 回退到默认范围
                 remaining_indices.remove(idx)
 
+        # 确保所有分数都被赋值
         for idx in remaining_indices:
             scores[idx] = np.random.randint(int(min_bound), int(max_bound) + 1)
 
@@ -189,15 +113,17 @@ class GradeProcessor:
             if abs(diff) <= 0.1:
                 break
 
-            indices = np.argsort(-weights_array)
+            # 优先调整权重较大的分数
+            indices = np.argsort(-weights_array)  # 按权重从大到小排序
             for idx in indices:
                 weight = weights[idx]
                 if weight > 0:
+                    # 计算调整量（尽量整数）
                     adjustment = diff / weight
                     if adjustment > 0:
-                        adjustment = max(1, int(adjustment))
+                        adjustment = max(1, int(adjustment))  # 向上调整
                     else:
-                        adjustment = min(-1, int(adjustment))
+                        adjustment = min(-1, int(adjustment))  # 向下调整
                     new_score = scores[idx] + adjustment
                     if min_bound <= new_score <= max_bound:
                         scores[idx] = new_score
@@ -205,19 +131,21 @@ class GradeProcessor:
 
             attempt += 1
 
+        # 最终微调（允许小数，保留 1 位）
         current_sum = np.sum(scores * weights_array)
         diff = target - current_sum
         if abs(diff) > 0.1:
-            indices = np.argsort(weights_array)
+            indices = np.argsort(weights_array)  # 优先调整权重最小的分数
             for idx in indices:
                 weight = weights[idx]
                 if weight > 0:
-                    adjustment = round(diff / weight, 1)
+                    adjustment = round(diff / weight, 1)  # 保留 1 位小数
                     new_score = scores[idx] + adjustment
                     if min_bound <= new_score <= max_bound:
                         scores[idx] = new_score
                         break
 
+        # 再次验证加权和
         current_sum = np.sum(scores * weights_array)
         diff = target - current_sum
         if abs(diff) > 0.1:
@@ -232,13 +160,20 @@ class GradeProcessor:
         """
         n = len(weights)
 
+        # 如果 target_sum = 0，直接返回全 0 分数
         if abs(target_sum) < 0.0001:
             return np.zeros(n).tolist()
 
+        # 计算分数范围
         min_bound, max_bound = self.calculate_score_bounds(target_sum, spread_mode)
+
+        # 生成初始整数分数
         scores = self.generate_initial_scores(target_sum, n, min_bound, max_bound, distribution)
+
+        # 逐步调整分数以满足加权和约束
         optimized_scores = self.adjust_scores(scores, target_sum, weights, min_bound, max_bound, distribution)
 
+        # 调试日志
         print(f"Generated scores: {optimized_scores.tolist()}")
         print(f"Distribution - Mean: {np.mean(optimized_scores):.2f}, Std: {np.std(optimized_scores):.2f}")
 
@@ -254,6 +189,7 @@ class GradeProcessor:
         output_dir = os.path.dirname(self.input_file)
         detail_output = os.path.join(output_dir, f'{course_name}成绩单详情.xlsx')
 
+        # 读取 Excel 文件并校验列名
         try:
             df = pd.read_excel(self.input_file)
         except Exception as e:
@@ -351,6 +287,8 @@ class GradeProcessor:
                 
                 if start_row != i:
                     worksheet.merge_cells(f'A{start_row}:A{i}')
+                    
+                adjust_column_widths(worksheet)
         except Exception as e:
             print(f"Error writing to Excel: {str(e)}")
             raise
@@ -413,6 +351,7 @@ class GradeProcessor:
             usual_avg = analysis_data[0].get(f'课程目标{obj}', 0)
             midterm_avg = analysis_data[3].get(f'课程目标{obj}', 0)
             final_avg = analysis_data[6].get(f'课程目标{obj}', 0)
+            # 修正 M 值计算公式
             m = usual_avg * usual_ratio + midterm_avg * midterm_ratio + final_avg * final_ratio
             m_row[f'课程目标{obj}'] = round(m, 1)
             m_values[obj] = m
@@ -462,6 +401,8 @@ class GradeProcessor:
                 worksheet.merge_cells(f'A{total_row_idx}:B{total_row_idx}')
                 worksheet.merge_cells(f'C{total_row_idx}:{chr(ord("C") + len(objectives) - 1)}{total_row_idx}')
                 worksheet[f'C{total_row_idx}'].alignment = Alignment(horizontal='center', vertical='center')
+                
+                adjust_column_widths(worksheet)
         except Exception as e:
             print(f"Error writing to Excel: {str(e)}")
             raise
@@ -469,58 +410,11 @@ class GradeProcessor:
         return total_achievement
 
     def load_previous_achievement(self, file_path: str) -> None:
-        """加载上一学年达成度表，处理目标数量不一致的情况"""
+        """加载上一学年达成度表"""
         if not file_path:
-            self.previous_achievement_data = {f'课程目标{i}': 0 for i in range(1, 6)}
-            self.previous_achievement_data['课程总目标'] = 0
             return
-        
         try:
-            df = pd.read_excel(file_path)
-            print(f"加载文件: {file_path}")
-            print(f"表格列名: {df.columns.tolist()}")
-            
-            if '考核环节' in df.columns:
-                print("检测到程序生成的达成度分析表，尝试解析...")
-                data = {f'课程目标{i}': 0 for i in range(1, 6)}
-                data['课程总目标'] = 0
-                
-                m_row = df[df['考核环节'] == '课程分目标达成度\n(M)']
-                if not m_row.empty:
-                    print(f"找到'课程分目标达成度(M)'行: {m_row.to_dict()}")
-                    for i in range(1, 6):
-                        col_name = f'课程目标{i}'
-                        if col_name in m_row.columns and pd.notna(m_row[col_name].iloc[0]):
-                            data[col_name] = float(m_row[col_name].iloc[0])
-                            print(f"提取 {col_name}: {data[col_name]}")
-                
-                total_row = df[df['考核环节'] == '课程总目标达成度']
-                if not total_row.empty:
-                    print(f"找到'课程总目标达成度'行: {total_row.to_dict()}")
-                    for col in total_row.columns:
-                        if col.startswith('课程目标') and pd.notna(total_row[col].iloc[0]):
-                            data['课程总目标'] = float(total_row[col].iloc[0])
-                            print(f"提取 课程总目标: {data['课程总目标']}")
-                            break
-                
-                self.previous_achievement_data = data
-            else:
-                print("未检测到'考核环节'列，尝试按照简单格式解析...")
-                required_columns = ['课程目标', '上一年度达成度']
-                missing_columns = [col for col in required_columns if col not in df.columns]
-                if missing_columns:
-                    raise ValueError(f"上一学年达成度表缺少以下必需列：{', '.join(missing_columns)}。请确保文件包含：{', '.join(required_columns)}。当前列名：{', '.join(df.columns)}")
-                
-                data = {f'课程目标{i}': 0 for i in range(1, 6)}
-                data['课程总目标'] = 0
-                
-                for _, row in df.iterrows():
-                    target = str(row['课程目标']).strip()
-                    if target in data and isinstance(row['上一年度达成度'], (int, float)):
-                        data[target] = float(row['上一年度达成度'])
-                
-                self.previous_achievement_data = data
-            
+            self.previous_achievement_data = pd.read_excel(file_path)
             if self.status_label:
                 self.status_label.setText(f"已加载上一学年达成度表: {os.path.basename(file_path)}")
         except Exception as e:
@@ -528,121 +422,17 @@ class GradeProcessor:
                 self.status_label.setText("加载上一学年达成度表失败！")
             raise ValueError(f"加载上一学年达成度表失败: {str(e)}")
 
-    def generate_improvement_report(self, current_achievement: Dict[str, float], course_name: str, num_objectives: int) -> None:
-        """生成课程持续改进机制信息报告"""
-        output_dir = os.path.dirname(self.input_file)
-        output_file = os.path.join(output_dir, f'{course_name}持续改进机制信息.xlsx')
-        
-        df_data = []
-        for i in range(1, 6):
-            prev_score = self.previous_achievement_data.get(f'课程目标{i}', 0)
-            current_score = current_achievement.get(f'课程目标{i}', 0)
-            next_score = current_score + 2 if current_score > 0 else 0
-            row = {
-                '课程目标': f'课程目标{i}',
-                '上一年度达成度': prev_score,
-                '本一年度目标达成度': current_score,
-                '本次达程度': 0,
-                '下一年度目标达程度': next_score
-            }
-            df_data.append(row)
-        
-        prev_total = self.previous_achievement_data.get('课程总目标', 0)
-        current_total = current_achievement.get('总达成度', 0)
-        next_total = current_total + 2 if current_total > 0 else 0
-        df_data.append({
-            '课程目标': '课程总目标',
-            '上一年度达成度': prev_total,
-            '本一年度目标达成度': current_total,
-            '本次达程度': 0,
-            '下一年度目标达程度': next_total
-        })
-        
-        questions = [
-            "针对上一年度存在问题的改进情况",
-            *[f"课程目标{i}达成情况分析" for i in range(1, 6)],
-            *[f"该课程目标{i}达成情况存在问题分析及改进措施" for i in range(1, 6)]
-        ]
-        
-        context = f"课程简介: {self.course_description}\n"
-        for i, req in enumerate(self.objective_requirements, 1):
-            context += f"课程目标{i}要求: {req}\n"
-        for i in range(1, 6):
-            prev_score = self.previous_achievement_data.get(f'课程目标{i}', 0)
-            current_score = current_achievement.get(f'课程目标{i}', 0)
-            context += f"课程目标{i}上一年度达成度: {prev_score}\n"
-            context += f"课程目标{i}本年度达成度: {current_score}\n"
-        context += f"课程总目标上一年度达成度: {prev_total}\n"
-        context += f"课程总目标本年度达成度: {current_total}\n"
-        
-        answers = []
-        total_questions = len(questions)
-        for i, question in enumerate(questions):
-            if self.status_label:
-                self.status_label.setText(f"正在调用 DeepSeek API，第 {i+1}/{total_questions} 个问题...")
-            if "课程目标" in question and int(question.split('课程目标')[1][0]) > num_objectives:
-                answers.append("无")
-            else:
-                prompt = f"{context}\n问题: {question}"
-                answer = self.call_deepseek_api(prompt)
-                answers.append(answer)
-        
-        df = pd.DataFrame(df_data)
-        try:
-            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Sheet1', startrow=0)
-                
-                worksheet = writer.sheets['Sheet1']
-                
-                # 设置“课程目标1”到“课程总目标”行的内容居中（前 6 行）
-                for row in range(2, 8):  # Excel 行号从 1 开始，第 2 行到第 7 行
-                    for col in range(1, 6):  # 列 A 到 E（第 1 列到第 5 列）
-                        cell = worksheet.cell(row=row, column=col)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-
-                # 写入 DeepSeek API 的问题和回答
-                start_row = len(df) + 2  # 在表格下方空一行后开始写入
-                for i, (question, answer) in enumerate(zip(questions, answers)):
-                    row = start_row + i
-                    worksheet[f'A{row}'].value = question
-                    worksheet[f'B{row}'].value = answer
-                    # 合并 B 列到 E 列为一个单元格
-                    worksheet.merge_cells(f'B{row}:E{row}')
-                    worksheet[f'B{row}'].alignment = Alignment(wrap_text=True, vertical='top')
-                    # 设置行高为 80 磅
-                    worksheet.row_dimensions[row].height = 80
-
-                # 设置列宽（单位为字符宽度）
-                worksheet.column_dimensions['A'].width = 20  # A 列宽 20 字符
-                worksheet.column_dimensions['B'].width = 20  # B 列宽 20 字符（B 到 E 已合并）
-        except Exception as e:
-            print(f"Error writing to Excel: {str(e)}")
-            raise
-
     def store_api_key(self, api_key: str) -> None:
         """存储API Key"""
         self.api_key = api_key
         if self.status_label:
             self.status_label.setText("已存储API Key")
 
-    def generate_ai_report(self, num_objectives: int, current_achievement: Dict[str, float]) -> None:
-        """生成AI分析报告"""
+    def generate_ai_report(self) -> None:
+        """生成AI分析报告（占位）"""
         if not self.api_key:
             if self.status_label:
                 self.status_label.setText("请先设置API Key")
             return
-        
-        course_name = self.course_name_input.text()
-        if not course_name:
-            if self.status_label:
-                self.status_label.setText("请先输入课程名称")
-            return
-        
-        try:
-            self.generate_improvement_report(current_achievement, course_name, num_objectives)
-            if self.status_label:
-                self.status_label.setText("AI分析报告已生成")
-        except Exception as e:
-            if self.status_label:
-                self.status_label.setText("生成AI分析报告失败！")
-            raise ValueError(f"生成AI分析报告失败: {str(e)}")
+        if self.status_label:
+            self.status_label.setText(f"API Key: {self.api_key}，AI分析报告功能待实现")

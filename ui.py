@@ -1,12 +1,34 @@
 import sys
 import os
+import json
+import pandas as pd
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QFileDialog, QMessageBox, QGridLayout, QDialog, 
                             QTextEdit, QComboBox, QScrollArea)
-from PyQt6.QtGui import QFont, QDoubleValidator
-from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QDoubleValidator
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from core import GradeProcessor
+
+class GenerateReportThread(QThread):
+    """用于在后台线程中生成AI分析报告"""
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, processor, num_objectives, current_achievement):
+        super().__init__()
+        self.processor = processor
+        self.num_objectives = num_objectives
+        self.current_achievement = current_achievement
+
+    def run(self):
+        try:
+            self.progress.emit("正在生成AI分析报告...")
+            self.processor.generate_ai_report(self.num_objectives, self.current_achievement)
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(f"生成AI分析报告失败：{str(e)}")
 
 class SettingsWindow(QDialog):
     def __init__(self, parent=None):
@@ -24,6 +46,8 @@ class SettingsWindow(QDialog):
         self.description_label = QLabel('课程简介：')
         self.description_input = QTextEdit()
         self.description_input.setFixedHeight(80)
+        # 加载已保存的课程简介
+        self.description_input.setText(self.parent().course_description)
         layout.addWidget(self.description_label)
         layout.addWidget(self.description_input)
         
@@ -37,11 +61,36 @@ class SettingsWindow(QDialog):
         self.import_prev_btn.clicked.connect(self.import_previous_achievement)
         layout.addWidget(self.import_prev_btn)
         
-        # API Key
+        # 显示导入文件的路径
+        self.file_path_label = QLabel('')
+        self.file_path_label.setStyleSheet('font-size: 12px; color: #666666;')
+        layout.addWidget(self.file_path_label)
+        # 加载已保存的路径
+        if self.parent().previous_achievement_file:
+            self.file_path_label.setText(self.parent().previous_achievement_file)
+        
+        # API Key 和检测按钮
+        api_layout = QHBoxLayout()
         self.api_key_label = QLabel('API KEY:')
         self.api_key_input = QLineEdit()
-        layout.addWidget(self.api_key_label)
-        layout.addWidget(self.api_key_input)
+        # 加载已保存的 API Key
+        self.api_key_input.setText(self.parent().api_key)
+        self.test_api_btn = QPushButton('检测')
+        self.test_api_btn.clicked.connect(self.test_api_connection)
+        api_layout.addWidget(self.api_key_label)
+        api_layout.addWidget(self.api_key_input)
+        api_layout.addWidget(self.test_api_btn)
+        layout.addLayout(api_layout)
+        
+        # 保存和清空按钮
+        button_layout = QHBoxLayout()
+        self.save_btn = QPushButton('保存')
+        self.save_btn.clicked.connect(self.save_settings)
+        self.clear_btn = QPushButton('清空')
+        self.clear_btn.clicked.connect(self.clear_settings)
+        button_layout.addWidget(self.save_btn)
+        button_layout.addWidget(self.clear_btn)
+        layout.addLayout(button_layout)
         
         self.setLayout(layout)
     
@@ -56,10 +105,14 @@ class SettingsWindow(QDialog):
                 item.widget().deleteLater()
         
         # 生成新输入框
+        parent_objective_requirements = self.parent().objective_requirements
         for i in range(num_objectives):
             label = QLabel(f'课程目标{i+1}要求')
             input_field = QLineEdit()
             input_field.setPlaceholderText(f'请输入目标{i+1}要求')
+            # 加载已保存的目标要求
+            if i < len(parent_objective_requirements):
+                input_field.setText(parent_objective_requirements[i])
             self.objective_inputs.append(input_field)
             self.objectives_layout.addWidget(label)
             self.objectives_layout.addWidget(input_field)
@@ -67,10 +120,71 @@ class SettingsWindow(QDialog):
         self.adjustSize()  # 自适应高度
     
     def import_previous_achievement(self):
+        # 提示用户文件格式要求
+        QMessageBox.information(
+            self,
+            '提示',
+            '请确保导入的上一学年达成度表包含以下列：\n'
+            '- "课程目标"（如：课程目标1, 课程目标2, ..., 课程总目标）\n'
+            '- "上一年度达成度"（达成度数值）\n'
+            '或者直接导入程序生成的“课程目标达成度分析表.xlsx”文件。'
+        )
         file_name, _ = QFileDialog.getOpenFileName(self, "选择上一学年达成度表", "", "Excel Files (*.xlsx)")
         if file_name:
             self.parent().previous_achievement_file = file_name
+            self.file_path_label.setText(file_name)
             QMessageBox.information(self, '成功', f'已选择文件: {os.path.basename(file_name)}')
+    
+    def save_settings(self):
+        """保存设置到配置文件"""
+        self.parent().course_description = self.description_input.toPlainText()
+        self.parent().objective_requirements = [input_field.text() for input_field in self.objective_inputs]
+        self.parent().api_key = self.api_key_input.text()
+        self.parent().save_config()
+        QMessageBox.information(self, '成功', '设置已保存')
+    
+    def clear_settings(self):
+        """清空设置"""
+        self.description_input.clear()
+        for input_field in self.objective_inputs:
+            input_field.clear()
+        self.file_path_label.clear()
+        self.parent().course_description = ""
+        self.parent().objective_requirements = []
+        self.parent().previous_achievement_file = ""
+        QMessageBox.information(self, '成功', '设置已清空')
+    
+    def test_api_connection(self):
+        """测试 DeepSeek API 连接"""
+        api_key = self.api_key_input.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, '警告', '请先输入 API Key')
+            return
+        
+        # 确保 processor 总是被正确初始化
+        parent = self.parent()
+        if parent.processor is None:
+            # 如果 input_file 为空，传入空字符串，因为 test_deepseek_api 不需要 input_file
+            input_file = parent.input_file if parent.input_file is not None else ""
+            parent.processor = GradeProcessor(
+                parent.course_name_input,
+                parent.num_objectives_input,
+                parent.weight_inputs,
+                parent.usual_ratio_input,
+                parent.midterm_ratio_input,
+                parent.final_ratio_input,
+                parent.status_label,
+                input_file,
+                course_description=parent.course_description,
+                objective_requirements=parent.objective_requirements
+            )
+        
+        result = parent.processor.test_deepseek_api(api_key)
+        
+        if result == "连接成功":
+            QMessageBox.information(self, '成功', '链接成功')
+        else:
+            QMessageBox.critical(self, '失败', f'链接失败：{result}')
 
 class GradeAnalysisApp(QMainWindow):
     def __init__(self):
@@ -81,7 +195,40 @@ class GradeAnalysisApp(QMainWindow):
         self.objective_requirements = []
         self.api_key = ""
         self.num_objectives = 0
+        self.processor = None
+        self.current_achievement = {}
+        # 加载保存的配置
+        self.load_config()
         self.initUI()
+    
+    def load_config(self):
+        """加载配置文件中的 API Key 和课程设置"""
+        config_file = os.path.join(os.path.dirname(__file__), 'config.json')
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    self.api_key = config.get('api_key', '')
+                    self.course_description = config.get('course_description', '')
+                    self.objective_requirements = config.get('objective_requirements', [])
+                    self.previous_achievement_file = config.get('previous_achievement_file', '')
+            except Exception as e:
+                print(f"加载配置文件失败: {str(e)}")
+    
+    def save_config(self):
+        """保存 API Key 和课程设置到配置文件"""
+        config_file = os.path.join(os.path.dirname(__file__), 'config.json')
+        config = {
+            'api_key': self.api_key,
+            'course_description': self.course_description,
+            'objective_requirements': self.objective_requirements,
+            'previous_achievement_file': self.previous_achievement_file
+        }
+        try:
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=4)
+        except Exception as e:
+            print(f"保存配置文件失败: {str(e)}")
     
     def initUI(self):
         # 设置窗口基本属性
@@ -133,7 +280,6 @@ class GradeAnalysisApp(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # 使用QScrollArea包裹内容
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(central_widget)
@@ -271,14 +417,13 @@ class GradeAnalysisApp(QMainWindow):
         self.import_btn.clicked.connect(self.select_file)
         self.settings_btn.clicked.connect(self.open_settings_window)
         self.export_btn.clicked.connect(self.start_analysis)
-        self.ai_report_btn.clicked.connect(self.generate_ai_report)
+        self.ai_report_btn.clicked.connect(self.start_generate_ai_report)
         
         # 设置默认值
         self.usual_ratio_input.setText('0.2')
         self.midterm_ratio_input.setText('0.3')
         self.final_ratio_input.setText('0.5')
         
-        # 初始调整按钮宽度
         self.adjust_button_widths()
 
     def resizeEvent(self, event):
@@ -354,7 +499,6 @@ class GradeAnalysisApp(QMainWindow):
             if total > 1.0:
                 QMessageBox.warning(self, '警告', '总权重系数为1')
             
-            # 如果总和为1，检查是否有未填框
             if abs(total - 1.0) < 0.0001 and empty_fields:
                 QMessageBox.warning(self, '警告', '请填写所有权重系数，未填写的请输入0')
         except ValueError:
@@ -396,6 +540,8 @@ class GradeAnalysisApp(QMainWindow):
         self.course_description = self.settings_window.description_input.toPlainText()
         self.objective_requirements = [input_field.text() for input_field in self.settings_window.objective_inputs]
         self.api_key = self.settings_window.api_key_input.text()
+        # 保存 API Key 到配置文件
+        self.save_config()
     
     def validate_inputs(self):
         try:
@@ -410,7 +556,7 @@ class GradeAnalysisApp(QMainWindow):
                 weight = float(text)
                 weights.append(weight)
             
-            # 导出时校验总和是否等于1
+            # 仅校验总和是否为1，移除 low <= high 校验
             if abs(sum(weights) - 1) > 0.0001:
                 raise ValueError("总权重系数为1")
             
@@ -451,8 +597,7 @@ class GradeAnalysisApp(QMainWindow):
             '均匀分布': 'uniform'
         }[self.dist_combo.currentText()]
         
-        # 初始化GradeProcessor
-        processor = GradeProcessor(
+        self.processor = GradeProcessor(
             self.course_name_input,
             self.num_objectives_input,
             self.weight_inputs,
@@ -465,33 +610,54 @@ class GradeAnalysisApp(QMainWindow):
             objective_requirements=self.objective_requirements
         )
         
-        # 加载上一年达成度表
-        processor.load_previous_achievement(self.previous_achievement_file)
-        processor.store_api_key(self.api_key)
+        self.processor.load_previous_achievement(self.previous_achievement_file)
+        self.processor.store_api_key(self.api_key)
         
         try:
             self.status_label.setText("正在处理数据...")
-            overall_achievement = processor.process_grades(num_objectives, weights, usual_ratio, midterm_ratio, final_ratio, 
+            overall_achievement = self.processor.process_grades(num_objectives, weights, usual_ratio, midterm_ratio, final_ratio, 
                                                           spread_mode, distribution)
+            # 构造当前达成度数据
+            self.current_achievement = {}
+            for i in range(1, num_objectives + 1):
+                # 从分析报告中提取达成度
+                df = pd.read_excel(f"{os.path.dirname(self.input_file)}/{self.course_name_input.text()}课程目标达成度分析表.xlsx")
+                m_row = df[df['考核环节'] == '课程分目标达成度\n(M)']
+                if not m_row.empty:
+                    self.current_achievement[f'课程目标{i}'] = m_row[f'课程目标{i}'].iloc[0] if f'课程目标{i}' in m_row else 0
+            self.current_achievement['总达成度'] = overall_achievement
             self.status_label.setText(f"处理完成！课程总目标达成度: {overall_achievement}")
             QMessageBox.information(self, '成功', '分析报告已生成')
         except Exception as e:
             self.status_label.setText("处理失败！")
             QMessageBox.critical(self, '错误', f'处理过程中发生错误：{str(e)}')
 
-    def generate_ai_report(self):
-        """生成AI分析报告"""
-        processor = GradeProcessor(
-            self.course_name_input,
-            self.num_objectives_input,
-            self.weight_inputs,
-            self.usual_ratio_input,
-            self.midterm_ratio_input,
-            self.final_ratio_input,
-            self.status_label,
-            self.input_file,
-            course_description=self.course_description,
-            objective_requirements=self.objective_requirements
-        )
-        processor.store_api_key(self.api_key)
-        processor.generate_ai_report()
+    def start_generate_ai_report(self):
+        """在后台线程中生成AI分析报告"""
+        if self.processor is None:
+            QMessageBox.warning(self, '错误', '请先进行成绩分析')
+            return
+        
+        # 创建线程
+        self.report_thread = GenerateReportThread(self.processor, self.num_objectives, self.current_achievement)
+        self.report_thread.finished.connect(self.on_generate_ai_report_finished)
+        self.report_thread.error.connect(self.on_generate_ai_report_error)
+        self.report_thread.progress.connect(self.update_status_label)
+        self.ai_report_btn.setEnabled(False)  # 禁用按钮，防止重复点击
+        self.report_thread.start()
+
+    def on_generate_ai_report_finished(self):
+        """生成报告完成时的回调"""
+        self.ai_report_btn.setEnabled(True)
+        self.status_label.setText("AI分析报告已生成")
+        QMessageBox.information(self, '成功', 'AI分析报告已生成')
+
+    def on_generate_ai_report_error(self, error_message):
+        """生成报告失败时的回调"""
+        self.ai_report_btn.setEnabled(True)
+        self.status_label.setText("生成AI分析报告失败！")
+        QMessageBox.critical(self, '错误', error_message)
+
+    def update_status_label(self, message):
+        """更新状态标签"""
+        self.status_label.setText(message)
