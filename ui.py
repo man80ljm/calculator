@@ -6,7 +6,7 @@ from PyQt6.QtGui import QIcon, QDoubleValidator, QIntValidator  # 导入 QIcon �
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QFileDialog, QMessageBox, QGridLayout, QDialog, 
-                            QTextEdit, QComboBox, QScrollArea,QProgressBar)
+                            QTextEdit, QComboBox, QDialogButtonBox,QProgressBar)
 from PyQt6.QtGui import QDoubleValidator
 from PyQt6.QtCore import Qt, QThread, pyqtSignal,QTimer
 from core import GradeProcessor
@@ -68,11 +68,27 @@ class GenerateReportThread(QThread):
         except Exception as e:
             self.error.emit(f"生成AI分析报告失败：{str(e)}")
 
+class TestApiThread(QThread):
+    """用于异步测试 DeepSeek API 连接的线程"""
+    result = pyqtSignal(str)  # 信号，用于传递测试结果
+
+    def __init__(self, processor, api_key):
+        super().__init__()
+        self.processor = processor
+        self.api_key = api_key
+
+    def run(self):
+        # 在线程中执行 API 连接测试
+        result = self.processor.test_deepseek_api(self.api_key)
+        self.result.emit(result)
+
+
+
 class SettingsWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('设置')
-        self.setFixedWidth(400)
+        self.setFixedWidth(500)
         self.initUI()
     
     def initUI(self):
@@ -169,9 +185,31 @@ class SettingsWindow(QDialog):
         )
         file_name, _ = QFileDialog.getOpenFileName(self, "选择上一学年达成度表", "", "Excel Files (*.xlsx)")
         if file_name:
-            self.parent().previous_achievement_file = file_name
-            self.file_path_label.setText(file_name)
-            QMessageBox.information(self, '成功', f'已选择文件: {os.path.basename(file_name)}')
+            # 验证文件格式
+            try:
+                df = pd.read_excel(file_name)
+                # 检查是否是程序生成的达成度分析表（包含“考核环节”列）
+                if '考核环节' in df.columns:
+                    # 进一步验证“课程分目标达成度\n(M)”和“课程总目标达成度”行是否存在
+                    if not ('课程分目标达成度\n(M)' in df['考核环节'].values and '课程总目标达成度' in df['考核环节'].values):
+                        QMessageBox.warning(self, '错误', '文件格式错误：不是有效的程序生成的“课程目标达成度分析表.xlsx”文件。')
+                        return
+                else:
+                    # 检查是否包含必需列
+                    required_columns = ['课程目标', '上一年度达成度']
+                    missing_columns = [col for col in required_columns if col not in df.columns]
+                    if missing_columns:
+                        QMessageBox.warning(self, '错误', f"文件缺少以下必需列：{', '.join(missing_columns)}。请确保文件包含：{', '.join(required_columns)}。")
+                        return
+                
+                # 如果验证通过，保存文件路径
+                self.parent().previous_achievement_file = file_name
+                self.file_path_label.setText(file_name)
+                QMessageBox.information(self, '成功', f'已选择文件: {os.path.basename(file_name)}')
+            except Exception as e:
+                QMessageBox.warning(self, '错误', f'无法读取文件：{str(e)}')
+                self.file_path_label.clear()
+                self.parent().previous_achievement_file = ""
     
     def save_settings(self):
         """保存设置到配置文件"""
@@ -187,9 +225,14 @@ class SettingsWindow(QDialog):
         for input_field in self.objective_inputs:
             input_field.clear()
         self.file_path_label.clear()
+        # 清空父对象中的数据（不包括 API Key）
         self.parent().course_description = ""
         self.parent().objective_requirements = []
         self.parent().previous_achievement_file = ""
+
+        # 保存清空后的配置到 config.json（API Key 保持不变）
+        self.parent().save_config()
+
         QMessageBox.information(self, '成功', '设置已清空')
     
     def test_api_connection(self):
@@ -217,12 +260,53 @@ class SettingsWindow(QDialog):
                 objective_requirements=parent.objective_requirements
             )
         
-        result = parent.processor.test_deepseek_api(api_key)
+        # 创建一个模态弹窗，显示“连接中”
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("测试连接")
+        dialog.setText("连接中...")
+        # 设置最小宽度
+        dialog.setMinimumWidth(400)  # 设置宽度为 300 像素，可以根据需要调整
+        # 设置样式以确保文本和按钮居中
+        dialog.setStyleSheet("""
+            QMessageBox {
+                min-width: 300px;
+            }
+            QMessageBox QLabel {
+                padding: 10px;
+                text-align: center;
+            }
+            QMessageBox QDialogButtonBox {
+                alignment: center;
+            }
+            QMessageBox QPushButton {
+                min-width: 80px;
+            }
+        """)
+        dialog.show()
         
+        # 创建线程来测试 API 连接
+        self.test_thread = TestApiThread(parent.processor, api_key)
+        self.test_thread.result.connect(lambda result: self.on_test_api_finished(dialog, result))
+        self.test_thread.start()
+    
+    def on_test_api_finished(self, dialog, result):
+        """处理 API 连接测试结果"""
         if result == "连接成功":
-            QMessageBox.information(self, '成功', '链接成功')
+            dialog.setText("连接成功")
         else:
-            QMessageBox.critical(self, '失败', f'链接失败：{result}')
+            dialog.setText(f"连接失败：{result}")
+        
+        # 确保文本居中
+        label = dialog.findChild(QLabel, "qt_msgbox_label")
+        if label:
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # 添加“确定”按钮，允许用户关闭弹窗
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        button_box = dialog.findChild(QDialogButtonBox)
+        if button_box:
+            button_box.setCenterButtons(True)
+        dialog.exec()
 
 class GradeAnalysisApp(QMainWindow):
     def __init__(self):
@@ -240,9 +324,29 @@ class GradeAnalysisApp(QMainWindow):
         self.initUI()
     
     def load_config(self):
-        """加载配置文件中的 API Key 和课程设置"""
-        config_file = os.path.join(os.path.dirname(__file__), 'config.json')
-        if os.path.exists(config_file):
+        """加载配置文件中的 API Key 和课程设置，启动时创建 config.json"""
+        # 使用用户的 AppData 目录存储 config.json
+        config_dir = os.path.join(os.getenv('APPDATA') or os.path.expanduser('~'), 'CalculatorApp')
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)  # 创建目录
+        config_file = os.path.join(config_dir, 'config.json')
+
+        # 如果 config.json 不存在，创建并初始化
+        if not os.path.exists(config_file):
+            # 初始化所有字段为空
+            config = {
+                'api_key': '',
+                'course_description': '',
+                'objective_requirements': [],
+                'previous_achievement_file': ''
+            }
+            try:
+                with open(config_file, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=4)
+            except Exception as e:
+                print(f"创建配置文件失败: {str(e)}")
+        else:
+            # 如果文件存在，加载配置
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
@@ -255,7 +359,12 @@ class GradeAnalysisApp(QMainWindow):
     
     def save_config(self):
         """保存 API Key 和课程设置到配置文件"""
-        config_file = os.path.join(os.path.dirname(__file__), 'config.json')
+        # 使用用户的 AppData 目录存储 config.json
+        config_dir = os.path.join(os.getenv('APPDATA') or os.path.expanduser('~'), 'CalculatorApp')
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)  # 创建目录
+        config_file = os.path.join(config_dir, 'config.json')
+
         config = {
             'api_key': self.api_key,
             'course_description': self.course_description,
@@ -266,6 +375,7 @@ class GradeAnalysisApp(QMainWindow):
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=4)
         except Exception as e:
+            QMessageBox.critical(self, '错误', f"无法保存配置文件 {config_file}：{str(e)}")
             print(f"保存配置文件失败: {str(e)}")
     
     def initUI(self):
@@ -827,11 +937,19 @@ class GradeAnalysisApp(QMainWindow):
             objective_requirements=self.objective_requirements
         )
         
-        if self.previous_achievement_file and os.path.exists(self.previous_achievement_file):
-            self.processor.load_previous_achievement(self.previous_achievement_file)
-        else:
-            self.processor.load_previous_achievement(None)
-        
+         # 加载上一学年达成度表，添加异常处理
+        try:
+            if self.previous_achievement_file and os.path.exists(self.previous_achievement_file):
+                self.processor.load_previous_achievement(self.previous_achievement_file)
+            else:
+                self.processor.load_previous_achievement(None)
+        except ValueError as e:
+            QMessageBox.critical(self, '错误', f'加载上一学年达成度表失败：{str(e)}\n请在设置中重新选择正确的文件。')
+            self.status_label.setText("加载上一学年达成度表失败！")
+            self.progress_bar.setVisible(False)
+            self.adjust_window_height()
+            return  # 停止执行后续步骤
+               
         self.processor.store_api_key(self.api_key)
         
         try:
