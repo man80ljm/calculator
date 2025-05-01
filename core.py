@@ -1,8 +1,9 @@
 import os
 import numpy as np
 import pandas as pd
+import json
 import requests
-from typing import List, Dict
+from typing import List, Dict,Callable, Optional
 from openpyxl.styles import Alignment, PatternFill, Font
 import openpyxl
 from utils import normalize_score, get_grade_level, calculate_final_score, calculate_achievement_level, adjust_column_widths
@@ -252,7 +253,7 @@ class GradeProcessor:
         return optimized_scores.tolist()
 
     def process_grades(self, num_objectives, weights, usual_ratio, midterm_ratio, final_ratio, 
-                      spread_mode='medium', distribution='uniform'):
+                      spread_mode='medium', distribution='uniform',progress_callback: Optional[Callable[[int], None]] = None):
         """处理成绩数据"""
         course_name = self.course_name_input.text()
         if not course_name:
@@ -278,6 +279,8 @@ class GradeProcessor:
         
         for idx, row in df.iterrows():
             self.status_label.setText(f"正在处理第 {idx+1}/{len(df)} 个学生的成绩...")
+            if progress_callback:
+                progress_callback(idx)  # 调用进度回调
             name = row['学生姓名']
             total_usual = row['平时成绩']
             total_midterm = row['期中成绩']
@@ -578,7 +581,7 @@ class GradeProcessor:
                 self.status_label.setText("加载上一学年达成度表失败！")
             raise ValueError(f"加载上一学年达成度表失败: {str(e)}")
 
-    def generate_improvement_report(self, current_achievement: Dict[str, float], course_name: str, num_objectives: int) -> None:
+    def generate_improvement_report(self, current_achievement: Dict[str, float], course_name: str, num_objectives: int, answers=None) -> None:
         """生成课程持续改进机制信息报告"""
         output_dir = os.path.dirname(self.input_file)
         output_file = os.path.join(output_dir, f'{course_name}持续改进机制信息.xlsx')
@@ -608,34 +611,54 @@ class GradeProcessor:
             '下一年度目标达程度': next_total
         })
         
-        # 调整问题排列顺序，按目标顺序排列
         questions = ["针对上一年度存在问题的改进情况"]
         for i in range(1, 6):
             questions.append(f"课程目标{i}达成情况分析")
             questions.append(f"该课程目标{i}达成情况存在问题分析及改进措施")
         
-        context = f"课程简介: {self.course_description}\n"
-        for i, req in enumerate(self.objective_requirements, 1):
-            context += f"课程目标{i}要求: {req}\n"
-        for i in range(1, 6):
-            prev_score = self.previous_achievement_data.get(f'课程目标{i}', 0)
-            current_score = current_achievement.get(f'课程目标{i}', 0)
-            context += f"课程目标{i}上一年度达成度: {prev_score}\n"
-            context += f"课程目标{i}本年度达成度: {current_score}\n"
-        context += f"课程总目标上一年度达成度: {prev_total}\n"
-        context += f"课程总目标本年度达成度: {current_total}\n"
-        
-        answers = []
-        total_questions = len(questions)
-        for i, question in enumerate(questions):
-            if self.status_label:
-                self.status_label.setText(f"正在调用 DeepSeek API，第 {i+1}/{total_questions} 个问题...")
-            if "课程目标" in question and int(question.split('课程目标')[1][0]) > num_objectives:
-                answers.append("无")
-            else:
+        # 使用传入的 answers 或生成新答案
+        if answers is None:
+            context = f"课程简介: {self.course_description}\n"
+            for i, req in enumerate(self.objective_requirements, 1):
+                context += f"课程目标{i}要求: {req}\n"
+            for i in range(1, 6):
+                prev_score = self.previous_achievement_data.get(f'课程目标{i}', 0)
+                current_score = current_achievement.get(f'课程目标{i}', 0)
+                context += f"课程目标{i}上一年度达成度: {prev_score}\n"
+                context += f"课程目标{i}本年度达成度: {current_score}\n"
+            context += f"课程总目标上一年度达成度: {prev_total}\n"
+            context += f"课程总目标本年度达成度: {current_total}\n"
+            
+            cache_file = os.path.join(output_dir, 'api_cache.json')
+            cached_answers = {}
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cached_answers = json.load(f)
+                except Exception as e:
+                    print(f"加载缓存失败: {str(e)}")
+            
+            answers = []
+            total_questions = len(questions)
+            for i, question in enumerate(questions):
+                if self.status_label:
+                    self.status_label.setText(f"正在处理第 {i+1}/{total_questions} 个问题...")
+                if "课程目标" in question and int(question.split('课程目标')[1][0]) > num_objectives:
+                    answers.append("无")
+                    continue
                 prompt = f"{context}\n问题: {question}"
-                answer = self.call_deepseek_api(prompt)
-                answers.append(answer)
+                cache_key = f"{course_name}_{question}"
+                if cache_key in cached_answers:
+                    answers.append(cached_answers[cache_key])
+                else:
+                    answer = self.call_deepseek_api(prompt)
+                    cached_answers[cache_key] = answer
+                    answers.append(answer)
+                    try:
+                        with open(cache_file, 'w', encoding='utf-8') as f:
+                            json.dump(cached_answers, f, indent=4, ensure_ascii=False)
+                    except Exception as e:
+                        print(f"保存缓存失败: {str(e)}")
         
         df = pd.DataFrame(df_data)
         try:

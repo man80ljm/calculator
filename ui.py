@@ -2,13 +2,13 @@ import sys
 import os
 import json
 import pandas as pd
-from PyQt6.QtGui import QIcon  # 导入 QIcon 类
+from PyQt6.QtGui import QIcon, QDoubleValidator, QIntValidator  # 导入 QIcon 类
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QFileDialog, QMessageBox, QGridLayout, QDialog, 
-                            QTextEdit, QComboBox, QScrollArea)
+                            QTextEdit, QComboBox, QScrollArea,QProgressBar)
 from PyQt6.QtGui import QDoubleValidator
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal,QTimer
 from core import GradeProcessor
 
 class GenerateReportThread(QThread):
@@ -16,17 +16,54 @@ class GenerateReportThread(QThread):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
+    progress_value = pyqtSignal(int)  # 新增进度值信号
 
-    def __init__(self, processor, num_objectives, current_achievement):
+    def __init__(self, processor, num_objectives, current_achievement, report_style):
         super().__init__()
         self.processor = processor
         self.num_objectives = num_objectives
         self.current_achievement = current_achievement
+        self.report_style = report_style  # 新增报告风格参数
 
     def run(self):
         try:
+            questions = ["针对上一年度存在问题的改进情况"]
+            for i in range(1, 6):
+                questions.append(f"课程目标{i}达成情况分析")
+                questions.append(f"该课程目标{i}达成情况存在问题分析及改进措施")
+            total_questions = len(questions)
             self.progress.emit("正在生成AI分析报告...")
-            self.processor.generate_ai_report(self.num_objectives, self.current_achievement)
+            self.progress_value.emit(0)
+
+            context = f"课程简介: {self.processor.course_description}\n"
+            for i, req in enumerate(self.processor.objective_requirements, 1):
+                context += f"课程目标{i}要求: {req}\n"
+            for i in range(1, 6):
+                prev_score = self.processor.previous_achievement_data.get(f'课程目标{i}', 0)
+                current_score = self.current_achievement.get(f'课程目标{i}', 0)
+                context += f"课程目标{i}上一年度达成度: {prev_score}\n"
+                context += f"课程目标{i}本年度达成度: {current_score}\n"
+            prev_total = self.processor.previous_achievement_data.get('课程总目标', 0)
+            current_total = self.current_achievement.get('总达成度', 0)
+            context += f"课程总目标上一年度达成度: {prev_total}\n"
+            context += f"课程总目标本年度达成度: {current_total}\n"
+
+            answers = []
+            course_name = self.processor.course_name_input.text()
+            for i, question in enumerate(questions):
+                self.progress.emit(f"正在处理第 {i+1}/{total_questions} 个问题...")
+                self.progress_value.emit(i + 1)
+                QApplication.processEvents()
+                if "课程目标" in question and int(question.split('课程目标')[1][0]) > self.num_objectives:
+                    answers.append("无")
+                    continue
+                # 将报告风格添加到提示中
+                prompt = f"{context}\n问题: {question}\n请以{self.report_style}的风格回答。"
+                answer = self.processor.call_deepseek_api(prompt)
+                answers.append(answer)
+
+            self.processor.generate_improvement_report(self.current_achievement, course_name, self.num_objectives, answers=answers)
+            self.progress_value.emit(total_questions)
             self.finished.emit()
         except Exception as e:
             self.error.emit(f"生成AI分析报告失败：{str(e)}")
@@ -232,11 +269,11 @@ class GradeAnalysisApp(QMainWindow):
             print(f"保存配置文件失败: {str(e)}")
     
     def initUI(self):
-        # 设置窗口图标
-        self.setWindowIcon(QIcon(r'D:\calculator\calculator.ico'))
-        # 设置窗口基本属性
+        import os
+        self.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), 'calculator.ico')))
         self.setWindowTitle('Scores Calculator')
-        self.setMinimumSize(800, 600)
+        # 移除 setMinimumSize 的高度限制，仅设置宽度
+        self.setMinimumWidth(800)
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #E6E6E6;
@@ -279,20 +316,13 @@ class GradeAnalysisApp(QMainWindow):
             }
         """)
         
-        # 创建主窗口部件和布局
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(central_widget)
-        self.setCentralWidget(scroll)
-        
+
         layout = QVBoxLayout(central_widget)
-        layout.setSpacing(20)
-        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(10)  # 减少间距
+        layout.setContentsMargins(20, 20, 20, 20)  # 减少边距
         
-        # 标题
         title_label = QLabel('课程目标达成度评价计算')
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setStyleSheet("""
@@ -302,7 +332,6 @@ class GradeAnalysisApp(QMainWindow):
         """)
         layout.addWidget(title_label)
         
-        # 添加课程名称输入
         course_layout = QHBoxLayout()
         course_label = QLabel('课程名称:')
         self.course_name_input = QLineEdit()
@@ -311,110 +340,114 @@ class GradeAnalysisApp(QMainWindow):
         course_layout.addStretch()
         layout.addLayout(course_layout)
         
-        # 第一行：课程目标数量和权重
         objectives_layout = QVBoxLayout()
-        
-        # 课程目标数量
         num_label = QLabel('课程目标数量')
         self.num_objectives_input = QLineEdit()
         self.num_objectives_input.setFixedWidth(150)
-        
-        # 创建水平布局放置数量输入
+        # 添加整数验证器，限制输入为数字
+        int_validator = QIntValidator(0, 15, self)
+        self.num_objectives_input.setValidator(int_validator)
         num_layout = QHBoxLayout()
         num_layout.addWidget(num_label)
         num_layout.addWidget(self.num_objectives_input)
         num_layout.addStretch()
         objectives_layout.addLayout(num_layout)
         
-        # 权重输入标签
         weights_label = QLabel('课程目标权重系数(总和为1)')
         objectives_layout.addWidget(weights_label)
         
-        # 权重输入框容器（使用QGridLayout支持换行）
         self.weights_container = QGridLayout()
         self.weights_container.setSpacing(10)
-        self.weights_container.setVerticalSpacing(15)
+        self.weights_container.setVerticalSpacing(10)
         self.weight_inputs = []
         objectives_layout.addLayout(self.weights_container)
         
         layout.addLayout(objectives_layout)
         
-        # 第二行：成绩占比
         ratios_layout = QHBoxLayout()
-        ratios_layout.setSpacing(30)
-        
-        # 平时成绩占比
+        ratios_layout.setSpacing(20)
         usual_layout = QVBoxLayout()
         usual_label = QLabel('平时成绩占比')
         self.usual_ratio_input = QLineEdit()
+        # 添加浮点数验证器，限制 0-1
+        ratio_validator = QDoubleValidator(0.0, 1.0, 2, self)
+        self.usual_ratio_input.setValidator(ratio_validator)
+        self.usual_ratio_input.textEdited.connect(self.validate_ratio_input)
         usual_layout.addWidget(usual_label)
         usual_layout.addWidget(self.usual_ratio_input)
         ratios_layout.addLayout(usual_layout)
-
-        # 添加伸缩空间
         ratios_layout.addStretch()
-
-        # 期中成绩占比
         midterm_layout = QVBoxLayout()
         midterm_label = QLabel('期中成绩占比')
         self.midterm_ratio_input = QLineEdit()
         midterm_layout.addWidget(midterm_label)
         midterm_layout.addWidget(self.midterm_ratio_input)
         ratios_layout.addLayout(midterm_layout)
-        
-        # 添加伸缩空间
         ratios_layout.addStretch()
-
-        # 期末成绩占比
         final_layout = QVBoxLayout()
         final_label = QLabel('期末成绩占比')
         self.final_ratio_input = QLineEdit()
         final_layout.addWidget(final_label)
         final_layout.addWidget(self.final_ratio_input)
         ratios_layout.addLayout(final_layout)
-        
         layout.addLayout(ratios_layout)
         
-        # 跨度和分布选择
         mode_layout = QHBoxLayout()
+        mode_layout.setSpacing(20)  # 增加间距
         spread_label = QLabel('分数跨度:')
         self.spread_combo = QComboBox()
         self.spread_combo.addItems(['大跨度 (12-23分)', '中跨度 (7-13分)', '小跨度 (2-8分)'])
         dist_label = QLabel('分布模式:')
         self.dist_combo = QComboBox()
         self.dist_combo.addItems(['正态分布', '左偏态分布', '右偏态分布', '均匀分布'])
+        style_label = QLabel('报告风格:')  # 新增报告风格下拉框
+        self.style_combo = QComboBox()
+        self.style_combo.addItems(['专业', '口语', '简洁', '详细', '幽默'])
         mode_layout.addWidget(spread_label)
         mode_layout.addWidget(self.spread_combo)
         mode_layout.addWidget(dist_label)
         mode_layout.addWidget(self.dist_combo)
+        mode_layout.addWidget(style_label)
+        mode_layout.addWidget(self.style_combo)
         mode_layout.addStretch()
         layout.addLayout(mode_layout)
+
+        layout.addSpacing(5)  # 减少额外间距
         
-        # 按钮布局：四个按钮平均分布
         self.buttons_layout = QHBoxLayout()
         self.buttons_layout.setSpacing(10)
-        
         self.import_btn = QPushButton('导入文件')
         self.settings_btn = QPushButton('设置')
         self.export_btn = QPushButton('导出结果')
         self.ai_report_btn = QPushButton('生成AI分析报告')
-        
-        # 添加按钮到布局
         self.buttons_layout.addWidget(self.import_btn)
         self.buttons_layout.addWidget(self.settings_btn)
         self.buttons_layout.addWidget(self.export_btn)
         self.buttons_layout.addWidget(self.ai_report_btn)
-        
         layout.addLayout(self.buttons_layout)
         
-        # 添加状态标签
         self.status_label = QLabel('')
         self.status_label.setStyleSheet('color: #666666;')
         layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #CCCCCC;
+                border-radius: 5px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #808080;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
+        # 移除 stretch，完全依赖 adjust_window_height 控制高度
         
-        layout.addStretch()
-        
-        # 连接信号
         self.num_objectives_input.textChanged.connect(self.update_weight_inputs)
         self.num_objectives_input.textChanged.connect(self.update_num_objectives)
         self.import_btn.clicked.connect(self.select_file)
@@ -422,17 +455,102 @@ class GradeAnalysisApp(QMainWindow):
         self.export_btn.clicked.connect(self.start_analysis)
         self.ai_report_btn.clicked.connect(self.start_generate_ai_report)
         
-        # 设置默认值
         self.usual_ratio_input.setText('0.2')
         self.midterm_ratio_input.setText('0.3')
         self.final_ratio_input.setText('0.5')
+
+        self.usual_ratio_input.setFixedWidth(150)
+        self.midterm_ratio_input.setFixedWidth(150)
+        self.final_ratio_input.setFixedWidth(150)
         
-        # 设置 Tab 顺序（初始设置，确保从 num_objectives_input 到 usual_ratio_input）
         self.setTabOrder(self.num_objectives_input, self.usual_ratio_input)
         self.setTabOrder(self.usual_ratio_input, self.midterm_ratio_input)
         self.setTabOrder(self.midterm_ratio_input, self.final_ratio_input)
         
         self.adjust_button_widths()
+        self.adjust_window_height()  # 初始调整高度
+    
+    def validate_ratio_input(self):
+        """实时验证成绩占比输入，限制 0-1 且必须是数字"""
+        sender = self.sender()  # 获取发出信号的输入框
+        text = sender.text()
+        
+        try:
+            value = float(text)
+            if value < 0 or value > 1:
+                sender.setText("")  # 清空非法输入
+        except ValueError:
+            sender.setText("")  # 清空非数字输入
+
+    def adjust_window_height(self):
+        """动态调整窗口高度以适应权重输入框和进度条"""
+        margin = 20
+        spacing = 10
+        global_margin = 10
+
+        try:
+            num_objectives = int(self.num_objectives_input.text()) if self.num_objectives_input.text() else 0
+        except ValueError:
+            num_objectives = 0
+
+        columns_per_row = 5
+        weight_rows = (num_objectives + columns_per_row - 1) // columns_per_row if num_objectives > 0 else 0
+        weight_input_height = 30
+        weight_label_height = 20
+        weight_row_spacing = 10
+        weight_margin = 5
+
+        weight_total_height = (
+            weight_label_height +
+            weight_rows * weight_input_height +
+            (weight_rows - 1) * weight_row_spacing +
+            weight_margin
+        ) if weight_rows > 0 else 0
+
+        title_height = 40
+        course_name_height = 30
+        num_objectives_height = 30
+        ratios_height = 80
+        mode_height = 30
+        buttons_height = 40
+        status_height = 20
+        progress_bar_height = 25 if self.progress_bar.isVisible() else 0
+
+        num_spacings = 8
+        total_spacing = num_spacings * spacing
+        extra_spacing = 5
+
+        total_height = (
+            margin * 2 +
+            title_height +
+            course_name_height +
+            num_objectives_height +
+            weight_label_height +
+            weight_total_height +
+            ratios_height +
+            mode_height +
+            buttons_height +
+            status_height +
+            progress_bar_height +
+            total_spacing +
+            extra_spacing +
+            global_margin
+        )
+
+        print(f"Calculated window height: {total_height}, weight_rows: {weight_rows}, progress_bar_visible: {self.progress_bar.isVisible()}")
+
+        # screen_height = QApplication.primaryScreen().availableGeometry().height()
+        # max_height = int(screen_height * 0.8)
+        # calculated_height = min(int(total_height), max_height)
+        
+        # 移除 max_height 限制，确保窗口高度完全适应内容
+        final_height = int(total_height)
+        # 动态设置最小高度
+        min_height = 400 if num_objectives == 0 else 450
+        final_height = max(final_height, min_height)
+
+        # 移除 setMinimumHeight 限制，直接调整高度
+        self.resize(self.width(), final_height)
 
     def resizeEvent(self, event):
         """重写resizeEvent以实现响应式布局"""
@@ -453,13 +571,11 @@ class GradeAnalysisApp(QMainWindow):
         self.ai_report_btn.setMinimumWidth(button_width)
 
     def update_weight_inputs(self):
-        # 清除现有的权重输入框
         for widget in self.weight_inputs:
             widget.setParent(None)
             widget.deleteLater()
         self.weight_inputs.clear()
         
-        # 清除布局中的所有项目
         while self.weights_container.count():
             item = self.weights_container.takeAt(0)
             if item.widget():
@@ -468,9 +584,9 @@ class GradeAnalysisApp(QMainWindow):
         try:
             num_objectives = int(self.num_objectives_input.text())
             if num_objectives <= 0 or num_objectives > 15:
+                self.adjust_window_height()  # 直接调整高度
                 return
                 
-            # 使用QGridLayout支持换行，每行最多5个输入框
             columns_per_row = 5
             validator = QDoubleValidator(0.0, 1.0, 2)
             for i in range(num_objectives):
@@ -484,17 +600,16 @@ class GradeAnalysisApp(QMainWindow):
                 col = i % columns_per_row
                 self.weights_container.addWidget(weight_input, row, col)
             
-            # 动态设置 Tab 顺序，从 num_objectives_input 到第一个 weight_input
             if self.weight_inputs:
-                # 确保从 num_objectives_input 切换到第一个 weight_input
                 self.setTabOrder(self.num_objectives_input, self.weight_inputs[0])
-                # 设置 weight_inputs 之间的 Tab 顺序
                 for i in range(len(self.weight_inputs) - 1):
                     self.setTabOrder(self.weight_inputs[i], self.weight_inputs[i + 1])
-                # 从最后一个 weight_input 切换到 usual_ratio_input
                 self.setTabOrder(self.weight_inputs[-1], self.usual_ratio_input)
         except ValueError:
-            pass
+            # 如果输入不是数字，清空输入框
+            self.num_objectives_input.setText("")
+        
+        self.adjust_window_height()  # 直接调整高度，移除防抖
 
     def validate_weights_sum(self):
         """实时校验权重总和，仅在超过1时提示，并检查未填框"""
@@ -560,29 +675,67 @@ class GradeAnalysisApp(QMainWindow):
     
     def validate_inputs(self):
         try:
+            # 检查课程名称是否为空
             if not self.course_name_input.text():
                 raise ValueError("请输入课程名称")
-            num_objectives = int(self.num_objectives_input.text())
+            
+            # 检查课程目标数量
+            num_objectives_text = self.num_objectives_input.text().strip()
+            if not num_objectives_text:
+                raise ValueError("课程目标数量不能为空")
+            try:
+                num_objectives = int(num_objectives_text)
+            except ValueError:
+                raise ValueError("课程目标数量必须为数字")
+            if num_objectives <= 0 or num_objectives > 15:
+                raise ValueError("课程目标数量必须在 1 到 15 之间")
+            
+            # 检查权重系数
             weights = []
-            for input_field in self.weight_inputs:
-                text = input_field.text()
+            for i, input_field in enumerate(self.weight_inputs, 1):
+                text = input_field.text().strip()
                 if not text:
-                    raise ValueError("请填写所有权重系数，未填写的请输入0")
-                weight = float(text)
+                    raise ValueError(f"权重{i}不能为空，请输入 0 或有效数字")
+                try:
+                    weight = float(text)
+                except ValueError:
+                    raise ValueError(f"权重{i}必须为数字")
+                if weight < 0 or weight > 1:
+                    raise ValueError(f"权重{i}必须在 0 到 1 之间")
                 weights.append(weight)
             
+            # 检查权重总和
             if abs(sum(weights) - 1) > 0.0001:
-                raise ValueError("总权重系数为1")
+                raise ValueError("总权重系数必须为 1")
             
-            usual_ratio = float(self.usual_ratio_input.text() or '0.2')
-            midterm_ratio = float(self.midterm_ratio_input.text() or '0.3')
-            final_ratio = float(self.final_ratio_input.text() or '0.5')
-            
+            # 检查成绩占比
+            usual_ratio_text = self.usual_ratio_input.text().strip()
+            midterm_ratio_text = self.midterm_ratio_input.text().strip()
+            final_ratio_text = self.final_ratio_input.text().strip()
+
+            if not usual_ratio_text:
+                raise ValueError("平时成绩占比不能为空")
+            if not midterm_ratio_text:
+                raise ValueError("期中成绩占比不能为空")
+            if not final_ratio_text:
+                raise ValueError("期末成绩占比不能为空")
+
+            try:
+                usual_ratio = float(usual_ratio_text)
+                midterm_ratio = float(midterm_ratio_text)
+                final_ratio = float(final_ratio_text)
+            except ValueError:
+                raise ValueError("成绩占比必须为数字")
+
+            if any(r < 0 or r > 1 for r in [usual_ratio, midterm_ratio, final_ratio]):
+                raise ValueError("成绩占比必须在 0 到 1 之间")
+
+            # 检查成绩占比总和
             if abs(usual_ratio + midterm_ratio + final_ratio - 1) > 0.0001:
-                raise ValueError("成绩占比之和必须等于1")
-                
+                raise ValueError("成绩占比之和必须等于 1")
+
             return num_objectives, weights, usual_ratio, midterm_ratio, final_ratio
-            
+
         except ValueError as e:
             QMessageBox.warning(self, '输入错误', str(e))
             return None
@@ -591,14 +744,64 @@ class GradeAnalysisApp(QMainWindow):
         if not self.input_file:
             QMessageBox.warning(self, '错误', '请先选择成绩单文件')
             return
+        
+        # 提前检查目标权重系数总和和成绩占比总和
+        weights_sum_error = False
+        ratios_sum_error = False
+
+        # 检查目标权重系数总和
+        try:
+            weights = []
+            for input_field in self.weight_inputs:
+                text = input_field.text()
+                if not text:
+                    weights.append(0.0)
+                else:
+                    weight = float(text)
+                    weights.append(weight)
             
+            weights_sum = sum(weights)
+            if abs(weights_sum - 1) > 0.0001:
+                weights_sum_error = True
+        except ValueError:
+            weights_sum_error = True
+
+        # 检查成绩占比总和
+        try:
+            usual_ratio_text = self.usual_ratio_input.text()
+            midterm_ratio_text = self.midterm_ratio_input.text()
+            final_ratio_text = self.final_ratio_input.text()
+            
+            if not usual_ratio_text or not midterm_ratio_text or not final_ratio_text:
+                ratios_sum_error = True
+            else:
+                usual_ratio = float(usual_ratio_text)
+                midterm_ratio = float(midterm_ratio_text)
+                final_ratio = float(final_ratio_text)
+                ratios_sum = usual_ratio + midterm_ratio + final_ratio
+                if abs(ratios_sum - 1) > 0.0001:
+                    ratios_sum_error = True
+        except ValueError:
+            ratios_sum_error = True
+
+        # 根据检查结果显示提示
+        if weights_sum_error and ratios_sum_error:
+            QMessageBox.warning(self, '输入错误', '目标权重系数总和需为 1，成绩占比总和需为 1')
+            return
+        elif weights_sum_error:
+            QMessageBox.warning(self, '输入错误', '目标权重系数总和需为 1')
+            return
+        elif ratios_sum_error:
+            QMessageBox.warning(self, '输入错误', '成绩占比总和需为 1')
+            return
+
+        # 如果总和检查通过，继续进行其他验证
         result = self.validate_inputs()
         if result is None:
             return
             
         num_objectives, weights, usual_ratio, midterm_ratio, final_ratio = result
         
-        # 获取模式
         spread_mode = {
             '大跨度 (12-23分)': 'large',
             '中跨度 (7-13分)': 'medium',
@@ -624,31 +827,91 @@ class GradeAnalysisApp(QMainWindow):
             objective_requirements=self.objective_requirements
         )
         
-        # 检查 previous_achievement_file 是否存在，如果不存在则跳过加载
         if self.previous_achievement_file and os.path.exists(self.previous_achievement_file):
             self.processor.load_previous_achievement(self.previous_achievement_file)
         else:
-            # 如果文件不存在，设置默认值（所有达成度为 0），避免报错
             self.processor.load_previous_achievement(None)
         
         self.processor.store_api_key(self.api_key)
         
         try:
+            # 读取输入文件
+            try:
+                df = pd.read_excel(self.input_file)
+            except FileNotFoundError:
+                QMessageBox.critical(self, '错误', '成绩单文件不存在，请重新选择')
+                return
+            except ValueError as e:
+                QMessageBox.critical(self, '错误', f'成绩单文件格式错误：{str(e)}')
+                return
+            except PermissionError:
+                QMessageBox.critical(self, '错误', '无权限读取成绩单文件，请检查文件权限')
+                return
+            except Exception as e:
+                QMessageBox.critical(self, '错误', f'读取成绩单文件失败：{str(e)}')
+                return
+
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setMaximum(len(df))
             self.status_label.setText("正在处理数据...")
-            overall_achievement = self.processor.process_grades(num_objectives, weights, usual_ratio, midterm_ratio, final_ratio, 
-                                                          spread_mode, distribution)
-            # 构造当前达成度数据
-            self.current_achievement = {}
+
+            # 检查课程名称是否包含非法字符
+            course_name = self.course_name_input.text().strip()
+            invalid_chars = '<>:"/\\|?*'
+            if any(char in course_name for char in invalid_chars):
+                QMessageBox.critical(self, '错误', f'课程名称包含非法字符：{invalid_chars}')
+                return
+
+            # 处理成绩数据
+            try:
+                overall_achievement = self.processor.process_grades(
+                    num_objectives, weights, usual_ratio, midterm_ratio, final_ratio,
+                    spread_mode, distribution,
+                    progress_callback=lambda idx: self.progress_bar.setValue(idx + 1)
+                )
+            except PermissionError:
+                QMessageBox.critical(self, '错误', '文件被占用，请关闭文件！')
+                return
+            except Exception as e:
+                QMessageBox.critical(self, '错误', f'处理成绩数据失败：{str(e)}')
+                return
+
+            # 读取生成的分析表
+            analysis_file = f"{os.path.dirname(self.input_file)}/{course_name}课程目标达成度分析表.xlsx"
+            try:
+                df = pd.read_excel(analysis_file)
+                for i in range(1, num_objectives + 1):
+                    m_row = df[df['考核环节'] == '课程分目标达成度\n(M)']
+                    if not m_row.empty:
+                        self.current_achievement[f'课程目标{i}'] = m_row[f'课程目标{i}'].iloc[0] if f'课程目标{i}' in m_row else 0
+            except FileNotFoundError:
+                QMessageBox.critical(self, '错误', f'分析表文件不存在：{analysis_file}')
+                return
+            except ValueError as e:
+                QMessageBox.critical(self, '错误', f'分析表文件格式错误：{str(e)}')
+                return
+            except PermissionError:
+                QMessageBox.critical(self, '错误', '无权限读取分析表文件，请检查文件权限')
+                return
+            except Exception as e:
+                QMessageBox.critical(self, '错误', f'读取分析表文件失败：{str(e)}')
+                return
+
             for i in range(1, num_objectives + 1):
-                df = pd.read_excel(f"{os.path.dirname(self.input_file)}/{self.course_name_input.text()}课程目标达成度分析表.xlsx")
                 m_row = df[df['考核环节'] == '课程分目标达成度\n(M)']
                 if not m_row.empty:
                     self.current_achievement[f'课程目标{i}'] = m_row[f'课程目标{i}'].iloc[0] if f'课程目标{i}' in m_row else 0
             self.current_achievement['总达成度'] = overall_achievement
+
             self.status_label.setText(f"处理完成！课程总目标达成度: {overall_achievement}")
+            self.progress_bar.setVisible(False)
+            self.adjust_window_height()
             QMessageBox.information(self, '成功', '分析报告已生成')
+
         except Exception as e:
             self.status_label.setText("处理失败！")
+            self.progress_bar.setVisible(False)
+            self.adjust_window_height()
             QMessageBox.critical(self, '错误', f'处理过程中发生错误：{str(e)}')
 
     def start_generate_ai_report(self):
@@ -657,34 +920,45 @@ class GradeAnalysisApp(QMainWindow):
             QMessageBox.warning(self, '错误', '请先进行成绩分析')
             return
         
-        # 检查设置中的内容是否完善
         if not self.course_description or not self.objective_requirements or not self.previous_achievement_file:
             QMessageBox.warning(self, '提示', '请完善设置中的内容')
             return
         
-        # 启动线程
-        self.report_thread = GenerateReportThread(self.processor, self.num_objectives, self.current_achievement)
+        # 获取用户选择的报告风格
+        report_style = self.style_combo.currentText()
+
+        self.report_thread = GenerateReportThread(self.processor, self.num_objectives, self.current_achievement, report_style=report_style)
         self.report_thread.finished.connect(self.on_generate_ai_report_finished)
         self.report_thread.error.connect(self.on_generate_ai_report_error)
         self.report_thread.progress.connect(self.update_status_label)
+        self.report_thread.progress_value.connect(self.progress_bar.setValue)  # 新增信号连接
         self.ai_report_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.adjust_window_height()  # 显示进度条时调整高度
+        self.progress_bar.setMaximum(11)  # 假设最多 11 个问题（1 + 5*2）
         self.report_thread.start()
 
     def on_generate_ai_report_finished(self):
         """生成报告完成时的回调"""
         self.ai_report_btn.setEnabled(True)
         self.status_label.setText("AI分析报告已生成")
+        self.progress_bar.setVisible(False)
+        self.adjust_window_height()  # 隐藏进度条时调整高度
         QMessageBox.information(self, '成功', 'AI分析报告已生成')
 
     def on_generate_ai_report_error(self, error_message):
         """生成报告失败时的回调"""
         self.ai_report_btn.setEnabled(True)
         self.status_label.setText("生成AI分析报告失败！")
+        self.progress_bar.setVisible(False)
+        self.adjust_window_height()  # 隐藏进度条时调整高度
         # 区分错误类型，显示不同的提示
         if "请先设置API Key" in error_message:
             QMessageBox.critical(self, '错误', '请填写API KEY')
         elif "API 调用失败" in error_message or "API 返回格式错误" in error_message:
             QMessageBox.critical(self, '错误', 'API KEY无效！')
+        elif isinstance(error_message, PermissionError) or "[Errno 13] Permission denied" in str(error_message):
+            QMessageBox.critical(self, '错误', '文件被占用，请关闭文件！')  # 优化提示
         else:
             QMessageBox.critical(self, '错误', error_message)
 
