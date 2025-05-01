@@ -108,3 +108,10 @@ git rm -r --cached __pycache__
 git rm -r --cached backup
 git rm -r --cached dist
 git rm -r --cached build
+
+
+打包指令：
+pyinstaller -F -w --icon=calculator.ico --add-data "calculator.ico;." main.py
+
+Linux/MacOS：
+pyinstaller -F -w --icon=calculator.ico --add-data "calculator.ico:." main.py
