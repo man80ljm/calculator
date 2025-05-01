@@ -35,7 +35,8 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 阿里云镜像
 pip install -r requirements.txt -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 
-
+直接安装requirements.txt
+pip install -r requirements.txt --index-url https://mirrors.aliyun.com/pypi/simple/
 
 依赖包列于 requirements.txt：
 PyQt6==6.5.2
